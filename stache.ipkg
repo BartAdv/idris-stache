@@ -1,0 +1,8 @@
+package stache
+
+pkgs = prelude, lightyear, specdris
+
+modules = Text.Mustache.Parser
+        , Test.ParserSpec
+
+tests = Test.ParserSpec.testParse
