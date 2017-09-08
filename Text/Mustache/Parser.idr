@@ -1,5 +1,6 @@
 module Text.Mustache.Parser
 
+import Control.Monad.State
 import Lightyear
 import Lightyear.Char
 import Lightyear.Combinators
@@ -7,15 +8,18 @@ import Lightyear.Position
 import Lightyear.Strings
 import public Text.Mustache.Type
 
--- TODO: configurable in original
-openingDel : String
-openingDel = "{{"
+-- the one from Lightyear.Strings
+%hide Parser
 
--- TODO: configurable in original
-closingDel : String
-closingDel = "}}"
+record Delimiters where
+  constructor MkDelimiters
+  openingDel : String
+  closingDel : String
 
-pBol : Parser ()
+Parser : Type -> Type
+Parser = ParserT String (State Delimiters)
+
+pBol : Monad m => ParserT str m ()
 pBol = do
   level <- colNo <$> getPosition
   when (level /= 1) empty
@@ -29,17 +33,18 @@ pLookAhead (PT f) =
   PT $ \r, us, cs, ue, ce, st =>
           f r
           (\t, s => us t st)
-          (\t, s => cs t st)
+          (\t, s => cs t st) -- cs or us ??
           ue
           ce
           st
 
 pTextBlock : Parser Node
 pTextBlock = do
-  requireFailure (string openingDel)
+  start <- gets openingDel
+  requireFailure (string start)
   -- FIXME: laziness?
   let terminator = choice $ the (List (Parser ()))
-        [ pure () <* pLookAhead (string openingDel)
+        [ pure () <* pLookAhead (string start)
         --, pBol -- TODO: what's that for?
         , eof
         ]
@@ -58,23 +63,28 @@ pKey = (map MkKey . lexeme) (implicit_ <|>| other <?> "key")
 
 pTag : String -> Parser Key
 pTag suffix = do
-  between (token $ openingDel <+> suffix) (string closingDel) pKey
+  start <- gets openingDel
+  end <- gets closingDel
+  between (token $ start <+> suffix) (string end) pKey
 
 pUnescapedVariable : Parser Node
 pUnescapedVariable = UnescapedVar <$> pTag "&"
 
 pUnescapedSpecial : Parser Node
 pUnescapedSpecial = do
-  between (token $ openingDel <+> "{") (string $ "}" <+> closingDel) $
+  start <- gets openingDel
+  end <- gets closingDel
+  between (token $ start <+> "{") (string $ "}" <+> end) $
     UnescapedVar <$> pKey
 
 pClosingTag : Key -> Parser ()
 pClosingTag key = do
+  start <- gets openingDel
+  end   <- gets closingDel
   let str = keyToString key
-  between (token $ openingDel <+> "/") (string closingDel) (string str)
+  between (token $ start <+> "/") (string end) (string str)
   pure ()
 
--- TODO: whitespace after >
 pPartial : (Position -> Maybe Position) -> Parser Node
 pPartial f = do
   pos <- f <$> getPosition
@@ -84,22 +94,38 @@ pPartial f = do
 
 pComment : Parser ()
 pComment = do
-  token (openingDel <+> "!")
-  manyTill anyChar (string closingDel)
+  start <- gets openingDel
+  end <- gets closingDel
+  token (start <+> "!")
+  manyTill anyChar (string end)
   pure ()
 
 pEscapedVariable : Parser Node
 pEscapedVariable = EscapedVar <$> pTag ""
 
-eol : Parser Char
+eol : (Stream Char str, Monad m) => ParserT str m Char
 eol = newline <|> crlf
 
-pStandalone : Parser a -> Parser a
+pStandalone : (Stream Char str, Monad m) => ParserT str m a -> ParserT str m a
 pStandalone p = -- pBol *>
   between sc (sc <* ((pure () <* eol) <|> eof)) p
 
 withStandalone : Parser a -> Parser a
 withStandalone p = pStandalone p <|> p
+
+pDelimiter : Parser String
+pDelimiter = pack <$> some (satisfy delChar) <?> "delimiter"
+  where delChar x = not (isSpace x) && x /= '='
+
+pSetDelimiters : Parser ()
+pSetDelimiters = do
+  start <- gets openingDel
+  end   <- gets closingDel
+  token (start <+> "=")
+  start' <- pDelimiter <* spaces
+  end'   <- pDelimiter <* spaces
+  token ("=" <+> end)
+  put (MkDelimiters start' end')
 
 mutual
   pSection : String -> (Key -> List Node -> Node) -> Parser Node
@@ -108,7 +134,6 @@ mutual
     nodes <- (pMustache . withStandalone . pClosingTag) key
     pure (f key nodes)
 
-  public
   pMustache : Parser () -> Parser (List Node)
   pMustache = map catMaybes . manyTill (choice alts)
     where
@@ -119,21 +144,26 @@ mutual
         , Just    <$> pSection "^" InvertedSection
         , Just    <$> pStandalone (pPartial Just)
         , Just    <$> pPartial (const Nothing)
-        -- , pure Nothing <*  withStandalone pSetDelimiters
+        , pure Nothing <* pSetDelimiters
         , Just    <$> pUnescapedVariable
         , Just    <$> pUnescapedSpecial
         , Just    <$> pEscapedVariable
         , Just    <$> pTextBlock
         ]
 
-pTest : Parser (List String)
-pTest = many $ string "frob"
+export
+parseMustache : Maybe String -> String -> Either String (List Node)
+parseMustache name src =
+  let initialDelims = MkDelimiters "{{" "}}"
+      Id (r,s) = flip runStateT initialDelims $ execParserT (pMustache eof) (initialState name src 8)
+  in case r of
+    MkReply _ (Success x)  => Right x
+    MkReply _ (Failure es) => Left $ concat $ intersperse "\n" $ map display es
 
-test1 : String
-test1 = """
-Hello {{name}}
-You have just won {{value}} dollars!
-{{#in_ca}}
-Well!, {{taxed_value}} dollars, after taxes.
-{{/in_ca}}
-"""
+testParse : Parser a -> String -> Either String (a, Delimiters)
+testParse p src =
+  let initialDelims = MkDelimiters "{{" "}}"
+      Id (r,s) = flip runStateT initialDelims $ execParserT p (initialState Nothing src 8)
+  in case r of
+    MkReply _ (Success x)  => Right (x,s)
+    MkReply _ (Failure es) => Left $ concat $ intersperse "\n" $ map display es
